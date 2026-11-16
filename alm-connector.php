@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 広告リンク管理 コネクタ (ALM Connector)
  * Description: ad-link-manager 本体を一切変更せず、外部アプリ（順位管理ツール）から案件のコメントアウト(disabled)を読み書きするためのREST APIだけを追加する。データは本体と同じ投稿メタ _alm_ad_campaigns / オプション alm_bt_map を共有する。
- * Version: 1.12.3
+ * Version: 1.13.0
  * Update URI: https://github.com/terasakisd/alm-connector/
  * Author: -
  *
@@ -59,6 +59,30 @@ class ALM_Connector {
 
         // 順位の自動入れ替え：配信時に h3#list_ ブロックを保存順に並べ替える（DB本文は無改変）
         add_filter('the_content', [$this, 'reorder_content'], 99);
+
+        // 順位管理ツールの「ブラウザ直接」接続用 CORS（/alm/v1/ のみ）
+        add_filter('rest_pre_serve_request', [$this, 'cors_headers'], 20, 4);
+    }
+
+    /**
+     * ブラウザから直接 /alm/v1/ を叩く接続方式（順位管理ツールの「ブラウザ直接」）のための CORS ヘッダ。
+     * WordPress 標準の Access-Control-Allow-Headers には X-ALM-Token が含まれず、ブラウザの
+     * プリフライト（OPTIONS）で弾かれるため、このプラグインのルートに限って許可ヘッダを足す。
+     * 認証はトークンで行うので Origin は制限しない（Cookie 認証は使わないため credentials も不要）。
+     */
+    public function cors_headers($served, $result, $request, $server) {
+        if (!($request instanceof WP_REST_Request)) return $served;
+        $route = (string) $request->get_route();
+        if (strpos($route, '/' . self::NS . '/') !== 0) return $served;
+        $origin = function_exists('get_http_origin') ? get_http_origin() : '';
+        if ($origin) {
+            header('Access-Control-Allow-Origin: ' . esc_url_raw($origin));
+            header('Vary: Origin', false);
+        }
+        header('Access-Control-Allow-Methods: OPTIONS, GET, POST');
+        header('Access-Control-Allow-Headers: Authorization, X-WP-Nonce, Content-Disposition, Content-MD5, Content-Type, X-ALM-Token');
+        header('Access-Control-Max-Age: 600');
+        return $served;
     }
 
     /* ---------- トークン設定画面 ---------- */
