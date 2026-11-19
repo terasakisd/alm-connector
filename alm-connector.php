@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 広告リンク管理 コネクタ (ALM Connector)
  * Description: ad-link-manager 本体を一切変更せず、外部アプリ（順位管理ツール）から案件のコメントアウト(disabled)を読み書きするためのREST APIだけを追加する。データは本体と同じ投稿メタ _alm_ad_campaigns / オプション alm_bt_map を共有する。
- * Version: 1.13.0
+ * Version: 1.14.0
  * Update URI: https://github.com/terasakisd/alm-connector/
  * Author: -
  *
@@ -266,6 +266,42 @@ class ALM_Connector {
                 'post_id' => ['type' => 'integer', 'required' => false],
             ],
         ]);
+
+        // bt対応表（bt ID → 遷移先URL）の書き込みマージ。
+        // WPサーバー自身が公開ページを取得できない環境（WAF等）では本体の自動構築が
+        // 働かないため、ツール側が公開ページから抽出した対応表をここから登録する。
+        register_rest_route(self::NS, '/bt-map', [
+            'methods'             => 'POST',
+            'callback'            => [$this, 'merge_bt_map'],
+            'permission_callback' => [$this, 'can_write'],
+            'args'                => [
+                'url' => ['type' => 'string', 'required' => false],
+                'map' => ['type' => 'object', 'required' => true], // {"bt123":"https://…/x.html…", …}
+            ],
+        ]);
+    }
+
+    /** POST /bt-map ：ツールが抽出した bt→URL を alm_bt_map にマージする */
+    public function merge_bt_map(WP_REST_Request $req) {
+        $in = $req->get_param('map');
+        if (!is_array($in)) {
+            return new WP_Error('alm_bad_request', 'map（オブジェクト）が必要です', ['status' => 400]);
+        }
+        $map = get_option('alm_bt_map', []);
+        if (!is_array($map)) $map = [];
+        $changed = 0;
+        foreach ($in as $bt => $url) {
+            $bt = strtolower(trim((string) $bt));
+            $url = trim((string) $url);
+            if (!preg_match('/^bt\d+$/', $bt)) continue;
+            if (!preg_match('#^https?://#i', $url)) continue;
+            if (!isset($map[$bt]) || $map[$bt] !== $url) {
+                $map[$bt] = $url;
+                $changed++;
+            }
+        }
+        if ($changed > 0) update_option('alm_bt_map', $map, false);
+        return new WP_REST_Response(['merged' => $changed, 'total' => count($map)], 200);
     }
 
     /* ---------- 権限 ---------- */
