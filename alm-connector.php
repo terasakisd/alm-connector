@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 広告リンク管理 コネクタ (ALM Connector)
  * Description: ad-link-manager 本体を一切変更せず、外部アプリ（順位管理ツール）から案件のコメントアウト(disabled)を読み書きするためのREST APIだけを追加する。データは本体と同じ投稿メタ _alm_ad_campaigns / オプション alm_bt_map を共有する。
- * Version: 1.14.0
+ * Version: 1.15.0
  * Update URI: https://github.com/terasakisd/alm-connector/
  * Author: -
  *
@@ -702,15 +702,156 @@ class ALM_Connector {
         if (!$hasOrder && !$hasHidden) return $content;
 
         try {
+            // 縦型（ブランドが列）の比較表は列ごと入れ替える。
+            // ブロック並べ替えより先に行う（テーブル内の位置を基準に処理するため）
+            $withCols = $this->apply_column_tables($content, $hasOrder ? $order : [], $hasHidden ? $hidden : []);
+            if (is_string($withCols) && $withCols !== '') $content = $withCols;
+
             $units = $this->find_rank_units($content);
-            if (empty($units)) return $content;
-            $new = $this->apply_order_inplace($content, $units, $hasOrder ? $order : [], $hasHidden ? $hidden : []);
-            // 安全策：異常（極端な長さ変化等）なら元の本文を返す
-            if (!is_string($new) || $new === '') return $content;
-            return $new;
+            if (!empty($units)) {
+                $new = $this->apply_order_inplace($content, $units, $hasOrder ? $order : [], $hasHidden ? $hidden : []);
+                // 安全策：異常（極端な長さ変化等）なら元の本文を返す
+                if (is_string($new) && $new !== '') $content = $new;
+            }
+            return $content;
         } catch (\Throwable $e) {
             return $content; // 何かあっても本文は壊さない
         }
+    }
+
+    /* ---------- 縦型（ブランド＝列）比較表の列入れ替え ---------- */
+
+    /** 行HTML（<tr>の中身）を <th>/<td> セルに分割する */
+    private function split_row_cells($rowInner) {
+        $cells = [];
+        $offset = 0;
+        while (preg_match('/<(th|td)\b[^>]*>/i', $rowInner, $m, PREG_OFFSET_CAPTURE, $offset)) {
+            $tag   = strtolower($m[1][0]);
+            $start = $m[0][1];
+            $end   = $this->match_element_end($rowInner, $tag, $start + strlen($m[0][0]));
+            if ($end === null) break;
+            $cells[] = ['tag' => $tag, 'start' => $start, 'end' => $end, 'html' => substr($rowInner, $start, $end - $start)];
+            $offset = $end;
+        }
+        return $cells;
+    }
+
+    /** セルHTMLからブランドを導く（data-rank ＞ /lp/リンク ＞ bt ID→対応表） */
+    private function brand_of_cell($html, $btmap) {
+        if (preg_match('/\bdata-rank\s*=\s*["\']([^"\']+)["\']/i', $html, $m)) {
+            $k = strtolower(trim($m[1]));
+            return (strncmp($k, 'topic_', 6) === 0) ? substr($k, 6) : $k;
+        }
+        if (preg_match('#/lp/([a-z0-9_\-]+)\.html#i', $html, $m)) return strtolower($m[1]);
+        if (!empty($btmap) && preg_match_all('/\bid=["\'](bt\d+)["\']/i', $html, $bm)) {
+            foreach ($bm[1] as $bt) {
+                $k = strtolower($bt);
+                if (isset($btmap[$k])) {
+                    $b = $this->brand_from_url($btmap[$k]);
+                    if ($b !== '') return strtolower($b);
+                }
+            }
+        }
+        return '';
+    }
+
+    /**
+     * 「最初の行に、ブランドを特定できるセルが2つ以上あるテーブル」を縦型比較表とみなし、
+     * ブランド列を保存順に入れ替える（hidden のブランドの列は出力から除外）。
+     * ブランドを特定できない列（項目名の列など）は位置を動かさない。
+     * 列数（セル数）が合わない行（colspan 等）はその行だけ触らない。
+     */
+    public function apply_column_tables($content, $order, $hidden) {
+        if (!preg_match_all('/<table\b[^>]*>/i', $content, $tm, PREG_OFFSET_CAPTURE)) return $content;
+        $btmap = $this->bt_map_lower();
+
+        // 順位: キー → 順位index（表記ゆれ吸収のため記号抜きのキーでも引けるようにする）
+        $rank = [];
+        $r = 0;
+        foreach ((array) $order as $k) {
+            $k = strtolower(trim((string) $k));
+            if ($k === '') continue;
+            if (!isset($rank[$k])) $rank[$k] = $r;
+            $norm = preg_replace('/[^a-z0-9]/', '', $k);
+            if ($norm !== '' && !isset($rank[$norm])) $rank[$norm] = $r;
+            $r++;
+        }
+        $hiddenSet = [];
+        foreach ((array) $hidden as $h) {
+            $h = strtolower(trim((string) $h));
+            if ($h === '') continue;
+            $hiddenSet[$h] = true;
+            $norm = preg_replace('/[^a-z0-9]/', '', $h);
+            if ($norm !== '') $hiddenSet[$norm] = true;
+        }
+        $rankOf = function ($brand) use ($rank) {
+            if (isset($rank[$brand])) return $rank[$brand];
+            $norm = preg_replace('/[^a-z0-9]/', '', $brand);
+            return $rank[$norm] ?? PHP_INT_MAX;
+        };
+        $isHidden = function ($brand) use ($hiddenSet) {
+            if (isset($hiddenSet[$brand])) return true;
+            $norm = preg_replace('/[^a-z0-9]/', '', $brand);
+            return isset($hiddenSet[$norm]);
+        };
+
+        // テーブルを後ろから処理してオフセットを維持
+        $tables = [];
+        foreach ($tm[0] as $t) {
+            $start = $t[1];
+            $end = $this->match_element_end($content, 'table', $start + strlen($t[0]));
+            if ($end !== null) $tables[] = ['start' => $start, 'end' => $end];
+        }
+        usort($tables, function ($a, $b) { return $b['start'] <=> $a['start']; });
+
+        foreach ($tables as $t) {
+            $table = substr($content, $t['start'], $t['end'] - $t['start']);
+
+            // 最初の行からブランド列を読む
+            if (!preg_match('/<tr\b[^>]*>(.*?)<\/tr>/is', $table, $rm)) continue;
+            $headCells = $this->split_row_cells($rm[1]);
+            $colCount = count($headCells);
+            if ($colCount < 2) continue;
+            $brands = [];
+            $brandedPos = [];
+            foreach ($headCells as $i => $c) {
+                $b = $this->brand_of_cell($c['html'], $btmap);
+                $brands[$i] = $b;
+                if ($b !== '') $brandedPos[] = $i;
+            }
+            if (count($brandedPos) < 2) continue; // 縦型比較表ではない
+
+            // 新しい列順（ブランド列の中だけで並べ替え・hidden は除外）
+            $visible = array_values(array_filter($brandedPos, function ($i) use ($brands, $isHidden) {
+                return !$isHidden($brands[$i]);
+            }));
+            usort($visible, function ($a, $b) use ($brands, $rankOf) {
+                $ra = $rankOf($brands[$a]);
+                $rb = $rankOf($brands[$b]);
+                if ($ra !== $rb) return $ra <=> $rb;
+                return $a <=> $b;
+            });
+            if ($visible === $brandedPos) continue; // 変化なし
+
+            $newTable = preg_replace_callback('/(<tr\b[^>]*>)(.*?)(<\/tr>)/is', function ($m) use ($brandedPos, $visible, $colCount) {
+                $cells = $this->split_row_cells($m[2]);
+                if (count($cells) !== $colCount) return $m[0]; // 列数が合わない行は触らない
+                $inner = $m[2];
+                // 後ろのスロットから、新しい列のセルHTMLを差し込む（余りスロットは削除＝hidden列）
+                for ($k = count($brandedPos) - 1; $k >= 0; $k--) {
+                    $slot = $brandedPos[$k];
+                    $srcHtml = ($k < count($visible)) ? $cells[$visible[$k]]['html'] : '';
+                    $dst = $cells[$slot];
+                    $inner = substr_replace($inner, $srcHtml, $dst['start'], $dst['end'] - $dst['start']);
+                }
+                return $m[1] . $inner . $m[3];
+            }, $table);
+
+            if (is_string($newTable) && $newTable !== '') {
+                $content = substr_replace($content, $newTable, $t['start'], $t['end'] - $t['start']);
+            }
+        }
+        return $content;
     }
 
     /**
