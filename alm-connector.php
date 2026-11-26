@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 広告リンク管理 コネクタ (ALM Connector)
  * Description: ad-link-manager 本体を一切変更せず、外部アプリ（順位管理ツール）から案件のコメントアウト(disabled)を読み書きするためのREST APIだけを追加する。データは本体と同じ投稿メタ _alm_ad_campaigns / オプション alm_bt_map を共有する。
- * Version: 1.15.0
+ * Version: 1.16.0
  * Update URI: https://github.com/terasakisd/alm-connector/
  * Author: -
  *
@@ -752,7 +752,35 @@ class ALM_Connector {
                 }
             }
         }
+        // メタモンリンク(Easy Link Jump): data-f（広告ファイル名）→ 無ければ href="#別名" を別名表で解決
+        if (preg_match('/\bdata-f=["\']([^"\']+)["\']/i', $html, $m)) {
+            $b = $this->brand_from_url($m[1]);
+            if ($b !== '') return strtolower($b);
+        }
+        if (preg_match_all('/\bhref=["\']#([^"\']+)["\']/i', $html, $am)) {
+            $files = $this->elj_alias_files();
+            foreach ($am[1] as $alias) {
+                $alias = urldecode($alias);
+                if (isset($files[$alias])) {
+                    $b = $this->brand_from_url($files[$alias]);
+                    if ($b !== '') return strtolower($b);
+                }
+            }
+        }
         return '';
+    }
+
+    /** メタモンリンク(Easy Link Jump)の別名→広告ファイル名の対応（無ければ空配列） */
+    private function elj_alias_files() {
+        static $map = null;
+        if ($map !== null) return $map;
+        $map = [];
+        foreach ((array) get_option('elj_aliases', []) as $row) {
+            if (!is_array($row) || empty($row['file'])) continue;
+            $alias = ltrim((string) ($row['alias'] ?? ''), '#');
+            if ($alias !== '') $map[$alias] = (string) $row['file'];
+        }
+        return $map;
     }
 
     /**
@@ -915,6 +943,22 @@ class ALM_Connector {
                     $k = strtolower($bt);
                     if (isset($btmap[$k])) {
                         $b = $this->brand_from_url($btmap[$k]);
+                        if ($b !== '') { $brand = strtolower($b); break; }
+                    }
+                }
+            }
+            // メタモンリンク(Easy Link Jump)構成: data-f（広告ファイル名）からブランドを引く
+            if ($brand === '' && preg_match('/\bdata-f=["\']([^"\']+)["\']/i', $html, $fm)) {
+                $b = $this->brand_from_url($fm[1]);
+                if ($b !== '') $brand = strtolower($b);
+            }
+            // 本文側では href="#別名" のまま（出力時に置換される）ため、別名表(elj_aliases)でも解決する
+            if ($brand === '' && preg_match_all('/\bhref=["\']#([^"\']+)["\']/i', $html, $am2)) {
+                $elj_file_by_alias = $this->elj_alias_files();
+                foreach ($am2[1] as $alias) {
+                    $alias = urldecode($alias);
+                    if (isset($elj_file_by_alias[$alias])) {
+                        $b = $this->brand_from_url($elj_file_by_alias[$alias]);
                         if ($b !== '') { $brand = strtolower($b); break; }
                     }
                 }
